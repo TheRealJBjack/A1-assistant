@@ -11,7 +11,7 @@ Key features:
 - Optional camera input for visual context.
 - Optional screen capture for sharing screen content.
 - Integration with Google Search for information retrieval.
-- Placeholder for custom function calling capabilities.
+- Function calling to launch predefined applications (e.g., web browsers, calculator).
 
 Dependencies:
 To run this script, you need to install the following Python packages:
@@ -22,6 +22,7 @@ import os
 import asyncio
 import base64
 import io
+import subprocess
 import traceback
 
 import cv2
@@ -44,6 +45,17 @@ MODEL = "models/gemini-2.5-flash-preview-native-audio-dialog"
 
 DEFAULT_MODE = "camera"
 
+# Predefined list of allowed programs for launching.
+# Keys are user-friendly names/aliases, values are executable paths.
+# IMPORTANT: For security, only add trusted applications.
+ALLOWED_PROGRAMS = {
+    "firefox": "firefox.exe",  # Example for Windows
+    "chrome": "chrome.exe",    # Example for Windows
+    "calculator": "calc.exe",  # Example for Windows
+    # Add more aliases and cross-platform names as needed
+    # e.g., "firefox": "firefox" on Linux
+}
+
 client = genai.Client(
     http_options={"api_version": "v1beta"},
     api_key=os.environ.get("GEMINI_API_KEY"),
@@ -53,6 +65,17 @@ tools = [
     types.Tool(google_search=types.GoogleSearch()),
     types.Tool(
         function_declarations=[
+            types.FunctionDeclaration(
+                name="launch_application",
+                description="Launches a specified application on the user's computer. Only a predefined list of applications are supported.",
+                parameters=types.Schema(
+                    type=types.Type.OBJECT,
+                    properties={
+                        "program_name": types.Schema(type=types.Type.STRING, description="The executable name of the program to launch (e.g., 'firefox.exe', 'chrome.exe').")
+                    },
+                    required=["program_name"]
+                )
+            )
         ]
     ),
 ]
@@ -197,6 +220,61 @@ class AudioLoop:
             data = await asyncio.to_thread(self.audio_stream.read, CHUNK_SIZE, **kwargs)
             await self.out_queue.put({"data": data, "mime_type": "audio/pcm"})
 
+    async def handle_function_call(self, function_call):
+        """Processes a function call request from the AI.
+
+        Currently supports 'launch_application'. Sends a FunctionResponse
+        back to the AI indicating the outcome.
+        """
+        if function_call.name == "launch_application":
+            program_name_input = function_call.args["program_name"].lower()
+            
+            # Normalize input, e.g. "firefox browser" -> "firefox"
+            # This is a simple example; more robust normalization might be needed.
+            executable_name = None
+            for app_alias, app_exe in ALLOWED_PROGRAMS.items():
+                if app_alias in program_name_input:
+                    executable_name = app_exe
+                    break
+            
+            if executable_name:
+                try:
+                    print(f"\n[Attempting to launch: {executable_name}]")
+                    subprocess.Popen([executable_name])
+                    response_content = f"Successfully launched {executable_name}."
+                    print(f"[Launched {executable_name}]")
+                except FileNotFoundError:
+                    response_content = f"Error: The application '{executable_name}' was not found."
+                    print(f"[Error launching {executable_name}: Not found]")
+                except Exception as e:
+                    response_content = f"An error occurred while trying to launch {executable_name}: {e}"
+                    print(f"[Error launching {executable_name}: {e}]")
+            else:
+                response_content = f"Error: Program '{program_name_input}' is not on the allowed list or is not recognized."
+                print(f"[Program '{program_name_input}' not allowed or recognized]")
+
+            # Send response back to the model
+            await self.session.send(
+                input=[types.Part(
+                    function_response=types.FunctionResponse(
+                        name="launch_application",
+                        response={"content": response_content}
+                    )
+                )],
+                end_of_turn=False # Or True, depending on desired interaction flow
+            )
+        else:
+            # Handle other function calls if any, or send a generic "not implemented"
+            await self.session.send(
+                input=[types.Part(
+                    function_response=types.FunctionResponse(
+                        name=function_call.name,
+                        response={"content": f"Function {function_call.name} is not implemented."}
+                    )
+                )],
+                end_of_turn=False
+            )
+
     async def receive_audio(self):
         "Background task to reads from the websocket and write pcm chunks to the output queue"
         while True:
@@ -207,6 +285,19 @@ class AudioLoop:
                     continue
                 if text := response.text:
                     print(text, end="")
+                
+                # Check for function call from the AI
+                if response.candidates and response.candidates[0].content and response.candidates[0].content.parts:
+                    for part in response.candidates[0].content.parts:
+                        if part.function_call: # AI is requesting a function call
+                            print(f"\n[Function Call: {part.function_call.name} with args: {part.function_call.args}]") 
+                            await self.handle_function_call(part.function_call)
+                            # The function handler will send a response back to the model.
+                            # We then break from processing further parts in this response and wait for the next turn.
+                            break 
+                    else: # else for the for loop, if no function_call part was found and `break` was not hit
+                        continue # continue to the next response in `turn`
+                    break # break from iterating `async for response in turn` because a function call was handled.
 
             # If you interrupt the model, it sends a turn_complete.
             # For interruptions to work, we need to stop playback.
